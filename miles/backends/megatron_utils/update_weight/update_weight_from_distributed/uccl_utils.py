@@ -16,18 +16,29 @@ Per bucket the trainer:
 
 import base64
 import json
+import logging
+import os
+import time
 from collections import deque
 
 import ray
 import torch
 from ray.actor import ActorHandle
 
-from miles.backends.megatron_utils.sglang import FlattenedTensorBucket
+logger = logging.getLogger(__name__)
 
 # Ring depth and per-slot headroom. Must match what the relay allocates; the trainer
 # passes num_slots/slot_bytes to the relay at connect time so both agree.
-DEFAULT_NUM_SLOTS = 2
-DEFAULT_SLOT_SIZE_MULT = 2
+# v2: 4 slots so the slot-gating ray.get is a no-op in steady state (the relay is
+# several buckets ahead), and 1.5x per-slot headroom to hold a single oversized tensor
+# (e.g. an 8B embedding ~1.24 GB) without a 2x memory blowup on the relay GPU.
+DEFAULT_NUM_SLOTS = 4
+# Set MILES_UCCL_PROFILE=1 to log a per-bucket gate/copy/write/rpc timing breakdown.
+_PROFILE = os.environ.get("MILES_UCCL_PROFILE", "0") == "1"
+
+
+def _slot_bytes_for(update_weight_buffer_size: int) -> int:
+    return update_weight_buffer_size + update_weight_buffer_size // 2  # 1.5x
 
 
 def _b64d(s: str) -> bytes:
@@ -84,7 +95,6 @@ def connect_rollout_relay_uccl(
     relay_engine: ActorHandle,
     update_weight_buffer_size: int,
     num_slots: int = DEFAULT_NUM_SLOTS,
-    slot_size_mult: int = DEFAULT_SLOT_SIZE_MULT,
 ) -> UcclTrainerConn:
     """Stand up the trainer->relay uccl connection. Built once, reused every step.
 
@@ -94,7 +104,7 @@ def connect_rollout_relay_uccl(
     """
     from uccl import p2p  # lazy import
 
-    slot_bytes = slot_size_mult * update_weight_buffer_size
+    slot_bytes = _slot_bytes_for(update_weight_buffer_size)
     conn = UcclTrainerConn(group_name)
     conn.ep = p2p.Endpoint(torch.cuda.current_device())
 
@@ -164,27 +174,34 @@ def update_weights_from_distributed_uccl(
     i = conn.bucket_cursor
     slot = i % conn.num_slots
     conn.bucket_cursor += 1
+    t0 = time.perf_counter()
 
     # Ring flow control: before reusing arena[slot], wait for the relay to have copied
-    # out the bucket that previously occupied this slot (i - num_slots).
+    # out the bucket that previously occupied this slot (i - num_slots). With num_slots=4
+    # the relay is normally several buckets ahead, so this ray.get is already resolved.
     if len(conn.recent_refs) >= conn.num_slots:
         ray.get(conn.recent_refs.popleft())
+    t_gate = time.perf_counter()
 
-    flattened_tensor = FlattenedTensorBucket(
-        named_tensors=list(converted_named_tensors)
-    ).get_flattened_tensor()
-    nbytes = flattened_tensor.numel() * flattened_tensor.element_size()
+    # v2 zero-copy source: write each tensor's bytes DIRECTLY into the pre-registered
+    # staging slot, byte-identical to FlattenedTensorBucket's layout (sequential concat of
+    # tensor.flatten().view(uint8), no padding). This drops the torch.cat allocation + the
+    # separate full-buffer staging copy of v1 (one pass instead of two).
+    nbytes = sum(t.numel() * t.element_size() for _, t in converted_named_tensors)
     if nbytes > conn.slot_bytes:
         raise RuntimeError(
             f"uccl trainer: bucket {nbytes} B exceeds slot size {conn.slot_bytes} B; "
-            "raise DEFAULT_SLOT_SIZE_MULT or lower --update-weight-buffer-size."
+            "raise DEFAULT_NUM_SLOTS headroom or lower --update-weight-buffer-size."
         )
-
     staging = conn.staging[slot]
-    staging_view = staging[:nbytes]
-    staging_view.copy_(flattened_tensor.view(torch.uint8).reshape(-1))
-    # Ensure the D2D copy is done before the NIC reads the staging buffer.
+    offset = 0
+    for _name, t in converted_named_tensors:
+        n = t.numel() * t.element_size()
+        staging[offset : offset + n].copy_(t.flatten().view(torch.uint8))
+        offset += n
+    # Ensure the copies are done before the NIC reads the staging buffer.
     torch.cuda.current_stream().synchronize()
+    t_copy = time.perf_counter()
 
     ok, transfer_id = conn.ep.write_async(
         conn.conn_id,
@@ -200,6 +217,7 @@ def update_weights_from_distributed_uccl(
         ok, done = conn.ep.poll_async(transfer_id)
         if not ok:
             raise RuntimeError("uccl trainer: poll_async reported failure")
+    t_write = time.perf_counter()
 
     # The write has landed in relay arena[slot]; the RPC below is the completion signal.
     ref = relay_engine.update_relay_weights_from_distributed.remote(
@@ -211,4 +229,13 @@ def update_weights_from_distributed_uccl(
         slot=slot,
     )
     conn.recent_refs.append(ref)
+
+    if _PROFILE:
+        t_rpc = time.perf_counter()
+        logger.info(
+            "[uccl-bkt %d] %.0fMB gate=%.1f copy=%.1f write+poll=%.1f rpc=%.1f ms (%.1f GB/s wire)",
+            i, nbytes / 1e6, 1e3 * (t_gate - t0), 1e3 * (t_copy - t_gate),
+            1e3 * (t_write - t_copy), 1e3 * (t_rpc - t_write),
+            nbytes / (t_write - t_copy) / 1e9 if t_write > t_copy else 0.0,
+        )
     return ref
