@@ -488,6 +488,9 @@ class SGLangEngine(RayActor):
         world_size,
         group_name,
         backend,
+        transport="nccl",
+        num_slots=0,
+        slot_bytes=0,
     ):
         return self._make_request(
             "init_relay_weights_update_group",
@@ -498,6 +501,9 @@ class SGLangEngine(RayActor):
                 "world_size": world_size,
                 "group_name": group_name,
                 "backend": backend,
+                "transport": transport,
+                "num_slots": num_slots,
+                "slot_bytes": slot_bytes,
             },
         )
 
@@ -603,6 +609,7 @@ class SGLangEngine(RayActor):
         group_name,
         flush_cache=False,
         load_format: str | None = "flattened_bucket",
+        slot: int = -1,
     ):
         return self._make_request(
             "update_relay_weights_from_distributed",
@@ -613,6 +620,7 @@ class SGLangEngine(RayActor):
                 "group_name": group_name,
                 "flush_cache": flush_cache,
                 "load_format": load_format,
+                "slot": slot,
             },
         )
 

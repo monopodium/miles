@@ -41,6 +41,9 @@ from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed.broadcast import UpdateWeightFromDistributed
 from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
 from .update_weight.update_weight_from_distributed.sendrecv_broadcast import UpdateWeightSendRecvBroadcast
+from .update_weight.update_weight_from_distributed.sendrecv_broadcast_uccl import (
+    UpdateWeightSendRecvBroadcastUccl,
+)
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
@@ -167,6 +170,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 update_weight_cls = UpdateWeightFromDistributed
             elif self.args.update_weight_transfer_mode == "p2p":
                 update_weight_cls = UpdateWeightP2P
+            elif self.args.update_weight_transfer_mode == "sendrecv_broadcast_uccl":
+                update_weight_cls = UpdateWeightSendRecvBroadcastUccl
             else:
                 update_weight_cls = UpdateWeightSendRecvBroadcast
         self.weight_updater = update_weight_cls(
