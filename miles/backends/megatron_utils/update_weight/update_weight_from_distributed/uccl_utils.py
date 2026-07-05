@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_NUM_SLOTS = 4
 # Set MILES_UCCL_PROFILE=1 to log a per-bucket gate/copy/write/rpc timing breakdown.
 _PROFILE = os.environ.get("MILES_UCCL_PROFILE", "0") == "1"
+# uccl one-sided write hits its fast path (line rate) only when the transfer size is a
+# multiple of kMaxSplitNum(16) * page(4096) = 64 KB; otherwise it drops ~5x. Round every
+# write up to this. See update_weights_from_distributed_uccl and run/bench_sizesweep.py.
+_WRITE_ALIGN = 65536
 
 
 def _slot_bytes_for(update_weight_buffer_size: int) -> int:
@@ -203,11 +207,22 @@ def update_weights_from_distributed_uccl(
     torch.cuda.current_stream().synchronize()
     t_copy = time.perf_counter()
 
+    # uccl fast-path alignment: the engine splits every message into kMaxSplitNum(=16)
+    # chunks and RDMA-writes them in parallel; each chunk is only page(4 KB)-aligned
+    # when message_size is a multiple of 16*4096 = 64 KB. Unaligned sizes fall onto a
+    # ~5x slower RDMA path (49.5 -> ~10.7 GB/s, verified in run/bench_sizesweep.py).
+    # Weight buckets are arbitrary byte sums, so round the transfer up to the next 64 KB
+    # (the relay reads only the true `total_bytes`; the padding bytes land in the arena
+    # tail and are never read). Staging has 1.5x headroom so the padded write always fits.
+    write_nbytes = (nbytes + _WRITE_ALIGN - 1) // _WRITE_ALIGN * _WRITE_ALIGN
+    if write_nbytes > conn.slot_bytes:
+        write_nbytes = nbytes  # pathological: no headroom for padding, fall back unpadded
+
     ok, transfer_id = conn.ep.write_async(
         conn.conn_id,
         conn.src_mr_ids[slot],
         staging.data_ptr(),
-        nbytes,
+        write_nbytes,
         conn.fifo_blobs[slot],
     )
     if not ok:
