@@ -32,13 +32,26 @@ logger = logging.getLogger(__name__)
 # v2: 4 slots so the slot-gating ray.get is a no-op in steady state (the relay is
 # several buckets ahead), and 1.5x per-slot headroom to hold a single oversized tensor
 # (e.g. an 8B embedding ~1.24 GB) without a 2x memory blowup on the relay GPU.
-DEFAULT_NUM_SLOTS = 4
+DEFAULT_NUM_SLOTS = int(os.environ.get("MILES_UCCL_NUM_SLOTS", "4"))
 # Set MILES_UCCL_PROFILE=1 to log a per-bucket gate/copy/write/rpc timing breakdown.
 _PROFILE = os.environ.get("MILES_UCCL_PROFILE", "0") == "1"
 # uccl one-sided write hits its fast path (line rate) only when the transfer size is a
 # multiple of kMaxSplitNum(16) * page(4096) = 64 KB; otherwise it drops ~5x. Round every
 # write up to this. See update_weights_from_distributed_uccl and run/bench_sizesweep.py.
 _WRITE_ALIGN = 65536
+
+# --- Optional DietGPU compression (opt-in via UCCL_P2P_COMPRESS_STRATEGY=split_only, needs a
+# USE_DIETGPU=1 uccl build). Constraints (see docs runbook 7j, run/bench_compress.py):
+#   * the compressed write requires reg-size == write-size, so we register each staging slot at
+#     a FIXED size S = update_weight_buffer_size and write exactly S bytes every bucket,
+#     zero-padding the tail (zeros compress to ~nothing). The relay reads only the true nbytes.
+#   * S must be <= the compress buffer (<= 1 GiB codec ceiling); weights are bf16 -> tag the MR.
+#   * a compressed write's poll_async completes when the data is SENT, not decompressed; the
+#     receiver decompresses async and (with the ack-after-decompress uccl fix) acks only when
+#     done. So after poll we call ep.wait_compressed_drained() before the completion RPC to
+#     guarantee the relay reads fully-decompressed data.
+_COMPRESS = os.environ.get("UCCL_P2P_COMPRESS_STRATEGY", "none") in ("split", "split_only")
+_COMPRESS_BUFFER_BYTES = int(os.environ.get("UCCL_P2P_COMPRESS_BUFFER_BYTES", str(1 << 30)))
 
 
 def _slot_bytes_for(update_weight_buffer_size: int) -> int:
@@ -108,7 +121,27 @@ def connect_rollout_relay_uccl(
     """
     from uccl import p2p  # lazy import
 
-    slot_bytes = _slot_bytes_for(update_weight_buffer_size)
+    # With compression, slots are a FIXED size S = update_weight_buffer_size (reg==write, and
+    # every bucket fits since buckets never exceed the buffer); S must be <= compress buffer
+    # <= 1 GiB. Without it, keep the 1.5x oversized-tensor headroom.
+    if _COMPRESS:
+        # Fixed-slot: reg-size == write-size == slot_bytes (each bucket zero-padded to the
+        # slot). Buckets are <= update_weight_buffer_size (<= 1 GiB codec per-message limit).
+        # The compress buffer (decompress arena) is larger to hold >=2 in-flight buckets for
+        # the 1b overlap pipeline.
+        slot_bytes = update_weight_buffer_size
+        if slot_bytes > (1 << 30):
+            raise RuntimeError(
+                f"uccl compression: --update-weight-buffer-size ({slot_bytes}) must be "
+                f"<= 1 GiB (codec per-message block limit)."
+            )
+        if slot_bytes > _COMPRESS_BUFFER_BYTES:
+            raise RuntimeError(
+                f"uccl compression: --update-weight-buffer-size ({slot_bytes}) must be "
+                f"<= UCCL_P2P_COMPRESS_BUFFER_BYTES ({_COMPRESS_BUFFER_BYTES})."
+            )
+    else:
+        slot_bytes = _slot_bytes_for(update_weight_buffer_size)
     conn = UcclTrainerConn(group_name)
     conn.ep = p2p.Endpoint(torch.cuda.current_device())
 
@@ -136,10 +169,12 @@ def connect_rollout_relay_uccl(
     if len(conn.fifo_blobs) != conn.num_slots:
         raise RuntimeError("uccl relay returned mismatched fifo blob count")
 
-    # 2. Register the trainer's persistent staging slots (RDMA source buffers).
+    # 2. Register the trainer's persistent staging slots (RDMA source buffers). Tag the MR
+    #    bf16 so the DietGPU float codec activates on the compressed path.
+    reg_float_type = p2p.FloatType.kBFloat16 if _COMPRESS else p2p.FloatType.kUndefined
     for _ in range(conn.num_slots):
         buf = torch.empty(conn.slot_bytes, dtype=torch.uint8, device=torch.cuda.current_device())
-        ok, mr_id = conn.ep.reg(buf.data_ptr(), conn.slot_bytes)
+        ok, mr_id = conn.ep.reg(buf.data_ptr(), conn.slot_bytes, reg_float_type)
         if not ok:
             raise RuntimeError("uccl trainer: reg() of staging buffer failed")
         conn.staging.append(buf)
@@ -157,6 +192,13 @@ def connect_rollout_relay_uccl(
 def disconnect_rollout_relay_uccl(
     group_name: str, conn: UcclTrainerConn, relay_engine: ActorHandle
 ) -> None:
+    # 1b drains per bucket on the relay, not the trainer, so any still-in-flight compressed
+    # write may hold a decompress-arena reservation. Drain them (best-effort) before teardown.
+    if _COMPRESS and conn.ep is not None and conn.conn_id is not None:
+        try:
+            conn.ep.wait_compressed_drained(conn.conn_id)
+        except Exception:
+            pass
     try:
         ray.get(relay_engine.destroy_relay_weights_update_group.remote(group_name))
     finally:
@@ -203,20 +245,30 @@ def update_weights_from_distributed_uccl(
         n = t.numel() * t.element_size()
         staging[offset : offset + n].copy_(t.flatten().view(torch.uint8))
         offset += n
-    # Ensure the copies are done before the NIC reads the staging buffer.
+
+    if _COMPRESS:
+        # Compressed path: reg-size == write-size == slot_bytes is required, so write the whole
+        # fixed slot. Zero the tail past the real data so the padding compresses to ~nothing
+        # (else stale bytes from a prior bucket in this slot would cost wire). The relay reads
+        # only the true total_bytes.
+        if offset < conn.slot_bytes:
+            staging[offset : conn.slot_bytes].zero_()
+        write_nbytes = conn.slot_bytes
+    else:
+        # uccl fast-path alignment: the engine splits every message into kMaxSplitNum(=16)
+        # chunks and RDMA-writes them in parallel; each chunk is only page(4 KB)-aligned
+        # when message_size is a multiple of 16*4096 = 64 KB. Unaligned sizes fall onto a
+        # ~5x slower RDMA path (49.5 -> ~10.7 GB/s, verified in run/bench_sizesweep.py).
+        # Weight buckets are arbitrary byte sums, so round the transfer up to the next 64 KB
+        # (the relay reads only the true `total_bytes`; the padding lands in the arena tail
+        # and is never read). Staging has 1.5x headroom so the padded write always fits.
+        write_nbytes = (nbytes + _WRITE_ALIGN - 1) // _WRITE_ALIGN * _WRITE_ALIGN
+        if write_nbytes > conn.slot_bytes:
+            write_nbytes = nbytes  # pathological: no headroom for padding, fall back unpadded
+
+    # Ensure the copies (and zero-pad) are done before the NIC reads the staging buffer.
     torch.cuda.current_stream().synchronize()
     t_copy = time.perf_counter()
-
-    # uccl fast-path alignment: the engine splits every message into kMaxSplitNum(=16)
-    # chunks and RDMA-writes them in parallel; each chunk is only page(4 KB)-aligned
-    # when message_size is a multiple of 16*4096 = 64 KB. Unaligned sizes fall onto a
-    # ~5x slower RDMA path (49.5 -> ~10.7 GB/s, verified in run/bench_sizesweep.py).
-    # Weight buckets are arbitrary byte sums, so round the transfer up to the next 64 KB
-    # (the relay reads only the true `total_bytes`; the padding bytes land in the arena
-    # tail and are never read). Staging has 1.5x headroom so the padded write always fits.
-    write_nbytes = (nbytes + _WRITE_ALIGN - 1) // _WRITE_ALIGN * _WRITE_ALIGN
-    if write_nbytes > conn.slot_bytes:
-        write_nbytes = nbytes  # pathological: no headroom for padding, fall back unpadded
 
     ok, transfer_id = conn.ep.write_async(
         conn.conn_id,
@@ -232,6 +284,12 @@ def update_weights_from_distributed_uccl(
         ok, done = conn.ep.poll_async(transfer_id)
         if not ok:
             raise RuntimeError("uccl trainer: poll_async reported failure")
+
+    # 1b overlap: do NOT drain per bucket here. poll_async only guarantees the compressed
+    # data was SENT; the receiver decompresses asynchronously. Rather than block the trainer,
+    # the relay's copy_out waits on the receiver-side decompress-done counter before reading,
+    # so bucket i's decompress overlaps bucket i+1's transfer (the decompress arena is sized
+    # to hold >=2 in-flight buckets). The completion RPC fires immediately below.
     t_write = time.perf_counter()
 
     # The write has landed in relay arena[slot]; the RPC below is the completion signal.
