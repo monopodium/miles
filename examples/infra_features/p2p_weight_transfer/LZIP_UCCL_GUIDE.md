@@ -4,7 +4,7 @@
 
 | Reviewer 问题 | 实验 | 脚本 |
 |---|---|---|
-| LYmN Q1：与 ZipNN / NeuZip / DFloat11 / ZipCCL 对比 | A1 编解码器对比（单 GPU，真实权重）；A2 整模型 weight-sync（2 节点） | `uccl/p2p/benchmarks/benchmark_codecs.py`、`benchmark_weight_sync.py` |
+| LYmN Q1：与 ZipNN / NeuZip / DFloat11 对比（ZipCCL 无开源代码，只在文中讨论） | A1 编解码器对比（单 GPU，真实权重）；A2 整模型 weight-sync（2 节点） | `uccl/p2p/benchmarks/benchmark_codecs.py`、`benchmark_weight_sync.py` |
 | LYmN Q2 / oNLh Q1：RL 端到端、整模型聚合 | B miles RL 训练端到端（2 节点 × 1 GPU，trainer 与 rollout 分节点） | `examples/infra_features/p2p_weight_transfer/run.py` + `summarize_lzip_e2e.py` |
 
 ## 0. 代码分支（都在 github.com/monopodium 下）
@@ -113,7 +113,7 @@ grep -h "GB/s" /root/results/var_split_*.txt | sort   # 按 size 汇总均值/�
 
 `benchmark_weight_sync.py` 自带 `sync_s_mean/std/min/max`（默认 10 次 + 1 次 warm-up）和 `size_distribution`（各尺寸区间的张量数、字节占比、是否走压缩），直接用来回答 oNLh Q1 的“所有尺寸的聚合结果”和“目标负载的张量尺寸分布”。A2 至少对 Qwen3-4B 和 Qwen3-8B 各跑一次（和实验 B 的模型一致）。
 
-## 4. 实验 A：与 ZipNN / NeuZip / DFloat11 / ZipCCL 对比（回答 LYmN Q1）
+## 4. 实验 A：与 ZipNN / NeuZip / DFloat11 对比（回答 LYmN Q1）
 
 ### A1 编解码器对比（单 GPU，真实 BF16 权重）
 
@@ -134,9 +134,8 @@ done
 | NeuZip | 最可比：GPU 在线压缩/解压，指数位 ANS（nvCOMP） | 实测压缩率 + GPU 压缩/解压吞吐（复现其无损方案：nvCOMP ANS 编码指数字节，符号+尾数原样存） |
 | DFloat11 | 解压在 GPU，但**压缩是离线 CPU**（Llama-3.1-8B 每个 block 约 191 s） | 压缩率按其 Huffman 方案精确计算；无法用于每步都变的 RL 权重 |
 | ZipNN | **CPU 压缩/解压** | 实测压缩率 + CPU 吞吐（16 线程） |
-| ZipCCL | GPU 在线、面向 collective，**无公开代码、无 P2P** | 按其固定 3-bit top-7 指数编码精确计算压缩率（oracle top-7，是其上界），吞吐引用其论文 |
 
-脚本最后打印 `modeled xfer s` = 压缩 + 压缩后字节/链路 + 解压（无重叠，因为 4 个 baseline 都不做 compression–communication overlap）。LZip-P2P 的真实端到端数字用 A2/B 的实测值。
+脚本最后打印 `modeled xfer s` = 压缩 + 压缩后字节/链路 + 解压（无重叠，因为这 3 个 baseline 都不做 compression–communication overlap）。LZip-P2P 的真实端到端数字用 A2/B 的实测值。
 
 ### A2 整模型 weight-sync（2 节点，trainer GPU → rollout GPU）
 
