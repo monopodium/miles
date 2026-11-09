@@ -5,7 +5,7 @@
 | Reviewer 问题 | 实验 | 脚本 |
 |---|---|---|
 | Q1：与 ZipNN / NeuZip / DFloat11 / ZipCCL 对比 | A1 编解码器对比（单 GPU，真实权重）；A2 整模型 weight-sync（2 节点） | `uccl/p2p/benchmarks/benchmark_codecs.py`、`benchmark_weight_sync.py` |
-| Q2：RL 端到端收益 | B miles RL 训练端到端（2 节点 × 2 GPU，trainer 与 rollout 分节点） | `examples/infra_features/p2p_weight_transfer/run.py` + `summarize_lzip_e2e.py` |
+| Q2：RL 端到端收益 | B miles RL 训练端到端（2 节点 × 1 GPU，trainer 与 rollout 分节点） | `examples/infra_features/p2p_weight_transfer/run.py` + `summarize_lzip_e2e.py` |
 
 ## 0. 代码分支（都在 github.com/monopodium 下）
 
@@ -30,13 +30,13 @@ HF 权重 → miles 用 SGLang loader      split: 符号+尾数(~50%) 立即发 
 1. **transfer buffer 必须在 GPU 上**（`UcclTransport.transfer_buffer_device = cuda`）：DietGPU 在 GPU 上压缩，NIC 走 GPUDirect RDMA。Mooncake/NIXL 默认用 CPU buffer，多一次 D2H 拷贝。
 2. **按权重精确注册压缩上下文**：UCCL 的压缩上下文绑定 `(addr, size, dtype)`。miles 端用 `reg_compress_only` 为每个权重槽注册一次并缓存（buffer 布局每次 sync 都一样）。整块 buffer 另有一个普通 `reg` 给小张量/非浮点张量直接写。
 3. **完成栅栏**：压缩写的 `write()` 返回时，数据只是到了对端的 staging arena，解压是异步的。`flush_compressed_writes(conn)` 等到所有 ACK（解压 kernel 完成后才发 ACK），之后 miles 才去 finalize。这一点同时回答了 Reviewer 2 的 Q2（完整性如何保证）。
-4. **每进程一个压缩器**：UCCL 的 DietGPU compressor 是进程级单例，miles 端用 `_compress_lock` 串行化压缩写。miles 保证每个 rollout rank 只有一个发送者（`assign_rollout_engine_ranks`），这满足 UCCL 接收端 arena 只服务一个压缩发送者的约束。**trainer rank 数 ≥ rollout rank 数时并行度最好**（下面的 2+2 配置正好 1:1）。
+4. **每进程一个压缩器**：UCCL 的 DietGPU compressor 是进程级单例，miles 端用 `_compress_lock` 串行化压缩写。miles 保证每个 rollout rank 只有一个发送者（`assign_rollout_engine_ranks`），这满足 UCCL 接收端 arena 只服务一个压缩发送者的约束。**trainer rank 数 ≥ rollout rank 数时并行度最好**（下面的 1+1 配置正好 1:1）。
 5. 只有 ≥ `UCCL_P2P_MIN_COMPRESS_BYTES`（默认 16 MiB）且 ≤ `UCCL_P2P_COMPRESS_BUFFER_BYTES` 的浮点权重会被压缩，其余原样写。
 
 ## 1. 机器要求
 
-- 2 台机器，每台 **2×B200**，每 GPU 一张 RDMA NIC（IB 或 RoCEv2；AWS 用 EFA 加 `UCCL_P2P_TRANSPORT=efa`），GPUDirect RDMA 可用（`nvidia_peermem` 或 dmabuf）。租机时确认：两台在同一 RDMA fabric 上（不是只有 TCP 以太网），并记下每 GPU 的 NIC 带宽（论文里要写）。
-- 每台主机内存 ≥ 512 GB（Megatron checkpoint 转换 + Ray）。
+- 2 台机器，每台 **1×B200**，每 GPU 一张 RDMA NIC（IB 或 RoCEv2；AWS 用 EFA 加 `UCCL_P2P_TRANSPORT=efa`），GPUDirect RDMA 可用（`nvidia_peermem` 或 dmabuf）。租机时确认：两台在同一 RDMA fabric 上（不是只有 TCP 以太网），并记下每 GPU 的 NIC 带宽（论文里要写）。
+- trainer 那台主机内存 ≥ 256 GB（Qwen3-8B 的 Adam 状态 offload 到 CPU 约 100 GB，加上 checkpoint 转换和 Ray）。
 - 共享或各自本地盘 ≥ 300 GB（模型、Megatron torch_dist checkpoint、数据集）。
 - 两台机器能互相 ssh / 访问 Ray 端口 6379、8265。
 
@@ -138,7 +138,7 @@ done
 
 ## 5. 实验 B：miles RL 端到端（回答 Q2）
 
-拓扑：node0 = 2 个 trainer GPU（Megatron，TP=2），node1 = 2 个 rollout GPU（两个单卡 SGLang engine）。每次权重更新都跨 RDMA 网络。模型用稠密的 Qwen3-8B（主结果）和 Qwen3-4B（第二个点）；30B 级 MoE 在 2 卡上训练放不下，不做。每个模型跑 3 组，**唯一变量是传输方式**：
+拓扑：node0 = 1 个 trainer GPU（Megatron，TP=1），node1 = 1 个 rollout GPU（一个单卡 SGLang engine）。每次权重更新都跨 RDMA 网络（一对 NIC）。模型用稠密的 Qwen3-4B 和 Qwen3-8B（8B 开 `--optimizer-cpu-offload`）；MoE 在单卡上训练放不下，不做。每个模型跑 3 组，**唯一变量是传输方式**：
 
 | 组 | `--p2p-transport` | `UCCL_P2P_COMPRESS_STRATEGY` | 作用 |
 |---|---|---|---|
@@ -168,9 +168,9 @@ python run.py run Qwen3-8B --node-rank 0 --head-ip <HEAD_IP> 2>&1 | tee /root/re
 
 Qwen3-4B 同理，把 `Qwen3-8B` 换成 `Qwen3-4B-2node`。
 
-显存预算（B200 180 GB）：Qwen3-8B 训练 TP=2 时每卡约 75 GB（权重+fp32 梯度+Adam），再加 UCCL 约 5 GB、两个 transfer buffer 各 1 GB；rollout 卡 `sglang_mem_fraction=0.7` 已留出 UCCL 的余量。若 OOM，先把 `UCCL_P2P_COMPRESS_BUFFER_BYTES` 降到 512 MiB。
+显存预算（B200 180 GB）：Qwen3-4B 单卡全量训练约 75 GB（权重+fp32 梯度+Adam）；Qwen3-8B 的 Adam 状态 offload 到 CPU 后约 50 GB + 激活。再加 UCCL 约 5 GB、两个 transfer buffer 各 1 GB。rollout 卡 `sglang_mem_fraction=0.7` 已留出 UCCL 的余量。若 OOM，先把 `UCCL_P2P_COMPRESS_BUFFER_BYTES` 降到 512 MiB，或调小 `max_tokens_per_gpu`。
 
-预算估计：每组 20 步，Qwen3-8B 短输出约 15–25 分钟，4096 输出约 1–2 小时；6～8 组加环境搭建，2 台 2×B200 约需 1 天。先跑短输出的 baseline/LZip 两组拿到主结果，再补长输出和 mooncake。
+预算估计：单卡训练和单引擎 rollout 都更慢，每组 20 步：Qwen3-4B 短输出约 20–30 分钟，Qwen3-8B 短输出约 30–45 分钟，4096 输出约 2–3 小时；6～8 组加环境搭建，约 1–1.5 天。先跑短输出的 baseline/LZip 两组拿到主结果，再补长输出和 mooncake。
 
 **两种 rollout 长度都要跑，并都报告**（避免被质疑挑设置）：
 
