@@ -87,9 +87,13 @@ cd /root/uccl/p2p
 # 正确性 + 新的完成栅栏（不再 sleep）
 UCCL_P2P_COMPRESS_STRATEGY=split_only torchrun --nnodes=2 --nproc_per_node=1 --node-rank=<0|1> \
   --master_addr=<HEAD_IP> tests/test_engine_write_compress.py --size $((64<<20)) --iters 32
-# 单张量吞吐（论文 Fig. 2 的复现）
-UCCL_P2P_COMPRESS_STRATEGY=split_only torchrun ... benchmarks/benchmark_uccl_compression.py
+# 单张量吞吐（论文 Fig. 2 的复现）。--fence 回答 Reviewer 2 Q1：计时是否包含接收端解压+写入目标 buffer
+for S in none encode split_only; do for F in none end each; do
+  UCCL_P2P_COMPRESS_STRATEGY=$S torchrun ... benchmarks/benchmark_uccl_compression.py --dtype bfloat16 --fence $F
+done; done
 ```
+
+`--fence none` 是旧口径（只到对端 staging arena）；`end` 是包含解压的稳态吞吐；`each` 是每条消息都等解压完成（最严格，等价于“接收端拿到可用数据”的延迟）。rebuttal 里用 `end`/`each` 的数字替换原图，或至少并列给出。
 
 ## 4. 实验 A：与 ZipNN / NeuZip / DFloat11 / ZipCCL 对比（回答 Q1）
 
