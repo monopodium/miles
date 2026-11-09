@@ -143,6 +143,12 @@ PREPARE_CONFIGS: dict[str, PrepareConfig] = {
     "Qwen3-8B": PrepareConfig(
         hf_repo="Qwen/Qwen3-8B",
         model_type="qwen3-8B",
+        convert_gpus_per_node=2,
+    ),
+    "Qwen3-4B-2node": PrepareConfig(
+        hf_repo="Qwen/Qwen3-4B",
+        model_type="qwen3-4B",
+        convert_gpus_per_node=2,
     ),
     "Qwen3-4B": PrepareConfig(
         hf_repo="Qwen/Qwen3-4B",
@@ -227,13 +233,28 @@ PREPARE_CONFIGS: dict[str, PrepareConfig] = {
 # ---------------------------------------------------------------------------
 
 RUN_CONFIGS: dict[str, RunConfig] = {
-    # dense, 2 nodes, disaggregated: node 0 trains, node 1 serves 8 one-GPU engines, so every weight update
-    # crosses the RDMA network (the LZip-P2P end-to-end experiment)
+    # LZip-P2P end-to-end experiment on 2 nodes x 2 GPUs (e.g. 2x B200 each), disaggregated: node 0 trains on
+    # both GPUs (TP=2), node 1 serves two one-GPU SGLang engines, so every weight update crosses the RDMA network
     "Qwen3-8B": RunConfig(
         model_type="qwen3-8B",
         nnodes=2,
-        num_train_gpus=8,
-        num_rollout_gpus=8,
+        gpus_per_node=2,
+        num_train_gpus=2,
+        num_rollout_gpus=2,
+        tp=2,
+        rollout_batch_size=8,
+        n_samples_per_prompt=8,
+        rollout_temperature=0.8,
+        global_batch_size=64,
+        sglang_gpus_per_engine=1,
+        sglang_mem_fraction=0.7,
+    ),
+    "Qwen3-4B-2node": RunConfig(
+        model_type="qwen3-4B",
+        nnodes=2,
+        gpus_per_node=2,
+        num_train_gpus=2,
+        num_rollout_gpus=2,
         tp=2,
         rollout_batch_size=8,
         n_samples_per_prompt=8,
