@@ -140,6 +140,10 @@ class RunConfig:
 # ---------------------------------------------------------------------------
 
 PREPARE_CONFIGS: dict[str, PrepareConfig] = {
+    "Qwen3-8B": PrepareConfig(
+        hf_repo="Qwen/Qwen3-8B",
+        model_type="qwen3-8B",
+    ),
     "Qwen3-4B": PrepareConfig(
         hf_repo="Qwen/Qwen3-4B",
         model_type="qwen3-4B",
@@ -223,6 +227,21 @@ PREPARE_CONFIGS: dict[str, PrepareConfig] = {
 # ---------------------------------------------------------------------------
 
 RUN_CONFIGS: dict[str, RunConfig] = {
+    # dense, 2 nodes, disaggregated: node 0 trains, node 1 serves 8 one-GPU engines, so every weight update
+    # crosses the RDMA network (the LZip-P2P end-to-end experiment)
+    "Qwen3-8B": RunConfig(
+        model_type="qwen3-8B",
+        nnodes=2,
+        num_train_gpus=8,
+        num_rollout_gpus=8,
+        tp=2,
+        rollout_batch_size=8,
+        n_samples_per_prompt=8,
+        rollout_temperature=0.8,
+        global_batch_size=64,
+        sglang_gpus_per_engine=1,
+        sglang_mem_fraction=0.7,
+    ),
     "Qwen3-4B": RunConfig(
         model_type="qwen3-4B",
         nnodes=1,
@@ -805,6 +824,10 @@ def cmd_run(
         env_vars["MC_TRANSFER_TIMEOUT"] = str(cfg.mc_transfer_timeout)
     env_vars.update(model_args_env)
     env_vars.update(cfg.extra_env_vars)
+    if mode == "p2p" and p2p_transport == "uccl":
+        # UCCL reads its knobs (UCCL_P2P_COMPRESS_STRATEGY, UCCL_P2P_COMPRESS_BUFFER_BYTES, ...) from the
+        # environment of the trainer and the rollout engine processes: forward them from the launching shell
+        env_vars.update({key: value for key, value in os.environ.items() if key.startswith("UCCL_")})
     runtime_env_json = json.dumps({"env_vars": env_vars})
 
     # --- Build train.py arguments ---
@@ -827,13 +850,13 @@ def cmd_run(
             "--rm-type",
             "deepscaler",
             "--num-rollout",
-            "13",
+            os.environ.get("NUM_ROLLOUT", "13"),
             "--rollout-batch-size",
             str(cfg.rollout_batch_size),
             "--n-samples-per-prompt",
             str(cfg.n_samples_per_prompt),
             "--rollout-max-response-len",
-            "100",
+            os.environ.get("ROLLOUT_MAX_RESPONSE_LEN", "100"),
             "--rollout-temperature",
             str(cfg.rollout_temperature),
             "--global-batch-size",
@@ -979,9 +1002,10 @@ def cmd_run(
     # P2P-specific SGLang args
     if mode == "p2p":
         args.append(
-            "--sglang-remote-instance-weight-loader-start-seed-via-nixl"
-            if p2p_transport == "nixl"
-            else "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine"
+            {
+                "nixl": "--sglang-remote-instance-weight-loader-start-seed-via-nixl",
+                "uccl": "--sglang-remote-instance-weight-loader-start-seed-via-uccl",
+            }.get(p2p_transport, "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine")
         )
 
     # Skip validation / model loader
@@ -1032,8 +1056,8 @@ def cmd_run(
         args.append("--check-weight-update-equal")
 
     args.extend(["--update-weight-transfer-mode", mode])
-    if mode == "p2p" and p2p_transport == "nixl":
-        args.extend(["--p2p-transport", "nixl"])
+    if mode == "p2p" and p2p_transport in ("nixl", "uccl"):
+        args.extend(["--p2p-transport", p2p_transport])
 
     # --- Submit Ray job (head node only, or single-node) ---
     if is_single_node or node_rank == 0:
@@ -1127,8 +1151,8 @@ def main():
         parser.add_argument(
             "--p2p-transport",
             default="mooncake",
-            choices=["mooncake", "nixl"],
-            help="P2P transport (default: mooncake)",
+            choices=["mooncake", "nixl", "uccl"],
+            help="P2P transport (default: mooncake); uccl = UCCL-P2P, LZip-P2P with UCCL_P2P_COMPRESS_STRATEGY=split_only",
         )
         parsed = parser.parse_args(sys.argv[2:])
         cmd_run(

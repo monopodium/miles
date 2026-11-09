@@ -62,7 +62,7 @@ class _RunnerSender:
 
 
 class UpdateWeightP2P(WeightTransferProtocol):
-    """Write target and supported MTP draft weights to published GPU addresses over Mooncake or NIXL."""
+    """Write target and supported MTP draft weights to published GPU addresses over Mooncake, NIXL or UCCL."""
 
     def __init__(self, args: Namespace) -> None:
         super().__init__(args)
@@ -212,11 +212,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
                 self.is_sender = False
                 return
             if self._transport is None:
-                self._transport = P2PTransport(
-                    NixlTransport(write_timeout=self.args.p2p_transfer_timeout)
-                    if self.args.p2p_transport == NixlTransport.name
-                    else MooncakeTransport()
-                )
+                self._transport = P2PTransport(_create_native_transport(self.args))
             remote_shards_by_runner_role = self._transport.connect(
                 self.cell_updaters_of_cell_id, engine_cell_ids, assignments, runner_roles
             )
@@ -295,3 +291,14 @@ class UpdateWeightP2P(WeightTransferProtocol):
             unregister_memory=self._transport.unregister_memory,
             write_timeout=self.args.p2p_transfer_timeout,
         )
+
+
+def _create_native_transport(args: Namespace):
+    if args.p2p_transport == NixlTransport.name:
+        return NixlTransport(write_timeout=args.p2p_transfer_timeout)
+    if args.p2p_transport == "uccl":
+        # CUDA/ROCm only, and uccl is an optional dependency: import only when selected
+        from miles.backends.training_utils.weight_update.protocols.transports.uccl import UcclTransport
+
+        return UcclTransport(write_timeout=args.p2p_transfer_timeout)
+    return MooncakeTransport()

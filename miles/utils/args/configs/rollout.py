@@ -363,11 +363,14 @@ class RolloutRelatedConfig(BaseConfig):
         str,
         Arg(
             type_parser=None,
-            choices=["mooncake", "nixl"],
+            choices=["mooncake", "nixl", "uccl"],
             help=(
                 "What a P2P weight update writes over. The rollout engines must publish their weights for it: "
                 "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine for mooncake, "
-                "--sglang-remote-instance-weight-loader-start-seed-via-nixl for nixl."
+                "--sglang-remote-instance-weight-loader-start-seed-via-nixl for nixl, "
+                "--sglang-remote-instance-weight-loader-start-seed-via-uccl for uccl (UCCL-P2P from GPU transfer "
+                "buffers; set UCCL_P2P_COMPRESS_STRATEGY=split_only on trainer and engines for LZip-P2P lossless "
+                "compression)."
             ),
         ),
     ] = "mooncake"
