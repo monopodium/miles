@@ -4,8 +4,8 @@
 
 | Reviewer 问题 | 实验 | 脚本 |
 |---|---|---|
-| Q1：与 ZipNN / NeuZip / DFloat11 / ZipCCL 对比 | A1 编解码器对比（单 GPU，真实权重）；A2 整模型 weight-sync（2 节点） | `uccl/p2p/benchmarks/benchmark_codecs.py`、`benchmark_weight_sync.py` |
-| Q2：RL 端到端收益 | B miles RL 训练端到端（2 节点 × 1 GPU，trainer 与 rollout 分节点） | `examples/infra_features/p2p_weight_transfer/run.py` + `summarize_lzip_e2e.py` |
+| LYmN Q1：与 ZipNN / NeuZip / DFloat11 / ZipCCL 对比 | A1 编解码器对比（单 GPU，真实权重）；A2 整模型 weight-sync（2 节点） | `uccl/p2p/benchmarks/benchmark_codecs.py`、`benchmark_weight_sync.py` |
+| LYmN Q2 / oNLh Q1：RL 端到端、整模型聚合 | B miles RL 训练端到端（2 节点 × 1 GPU，trainer 与 rollout 分节点） | `examples/infra_features/p2p_weight_transfer/run.py` + `summarize_lzip_e2e.py` |
 
 ## 0. 代码分支（都在 github.com/monopodium 下）
 
@@ -97,7 +97,23 @@ done; done
 
 `--fence none` 只计到压缩数据到达对端 staging arena；`end` 是包含解压的稳态吞吐；`each` 是每条消息都等解压完成。在 write 路径上报数字时用 `end`/`each`，口径才和论文原来的 send/recv 一致。
 
-## 4. 实验 A：与 ZipNN / NeuZip / DFloat11 / ZipCCL 对比（回答 Q1）
+### 3.1 重复实验与方差（回答 Reviewer oNLh Q2）
+
+论文 5.1 节写的是 “R 次独立运行 × 每次 128 次传输 + 1 次 warm-up”。至少跑 R=5 次，取均值和标准差，重点看 16/32 MB（收益小、最需要误差条）：
+
+```bash
+for R in 1 2 3 4 5; do
+  UCCL_P2P_COMPRESS_STRATEGY=split_only torchrun ... benchmarks/benchmark_uccl_compression.py --dtype bfloat16 \
+    --fence end 2>&1 | tee /root/results/var_split_$R.txt
+  UCCL_P2P_COMPRESS_STRATEGY=none       torchrun ... benchmarks/benchmark_uccl_compression.py --dtype bfloat16 \
+    2>&1 | tee /root/results/var_none_$R.txt
+done
+grep -h "GB/s" /root/results/var_split_*.txt | sort   # 按 size 汇总均值/标准差
+```
+
+`benchmark_weight_sync.py` 自带 `sync_s_mean/std/min/max`（默认 10 次 + 1 次 warm-up）和 `size_distribution`（各尺寸区间的张量数、字节占比、是否走压缩），直接用来回答 oNLh Q1 的“所有尺寸的聚合结果”和“目标负载的张量尺寸分布”。A2 至少对 Qwen3-4B 和 Qwen3-8B 各跑一次（和实验 B 的模型一致）。
+
+## 4. 实验 A：与 ZipNN / NeuZip / DFloat11 / ZipCCL 对比（回答 LYmN Q1）
 
 ### A1 编解码器对比（单 GPU，真实 BF16 权重）
 
@@ -136,7 +152,7 @@ done
 
 每次迭代都做 bit-exact 校验；输出 `sync_s_median`（整模型同步 + 完成栅栏的时间）和 `effective_GBps`。注意 GLM-4-9B 的 `embed_tokens`/`lm_head`（约 1.2 GB）要能被压缩，就需要 `UCCL_P2P_COMPRESS_BUFFER_BYTES ≥ 2^31`；1 GiB 时它们会走不压缩路径，结果里 `compressed_path_fraction` 会体现。
 
-## 5. 实验 B：miles RL 端到端（回答 Q2）
+## 5. 实验 B：miles RL 端到端（回答 LYmN Q2、oNLh Q1）
 
 拓扑：node0 = 1 个 trainer GPU（Megatron，TP=1），node1 = 1 个 rollout GPU（一个单卡 SGLang engine）。每次权重更新都跨 RDMA 网络（一对 NIC）。模型用稠密的 Qwen3-4B 和 Qwen3-8B（8B 开 `--optimizer-cpu-offload`）；MoE 在单卡上训练放不下，不做。每个模型跑 3 组，**唯一变量是传输方式**：
 
